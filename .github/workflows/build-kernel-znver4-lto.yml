@@ -1,0 +1,266 @@
+name: Build kernel-cachyos-znver4-lto
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Force SRPM build and COPR submission even if version already exists"
+        type: boolean
+        default: false
+      tag:
+        description: "Optional CachyOS/linux tag override (e.g. cachyos-7.3.6-2)"
+        type: string
+        default: ""
+  schedule:
+    - cron: "0 20 * * *"
+
+concurrency:
+  group: build-kernel-znver4-lto
+  cancel-in-progress: false
+
+env:
+  SPEC_PATH: sources/kernel-cachyos-bore/kernel-cachyos-lto.spec
+  PKG_NAME: kernel-cachyos-znver4-lto
+  COPR_PROJECT: ${{ vars.COPR_PROJECT || 'kernel-cachyos-znver4-lto' }}
+  COPR_USERNAME_VAR: ${{ vars.COPR_USERNAME }}
+  COPR_CHROOT: ${{ vars.COPR_CHROOT || 'fedora-45-x86_64' }}
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Resolve target CachyOS/linux release
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG_OVERRIDE: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Pattern: cachyos-X.Y.Z-N (stable releases only; excludes rc, hotfix, etc.)
+          TAG_REGEX='^cachyos-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$'
+
+          if [ -n "$TAG_OVERRIDE" ]; then
+            if ! [[ "$TAG_OVERRIDE" =~ $TAG_REGEX ]]; then
+              echo "::error::Tag override '$TAG_OVERRIDE' does not match $TAG_REGEX"
+              exit 1
+            fi
+            TAG="$TAG_OVERRIDE"
+            echo "Using manually specified tag: $TAG"
+          else
+            # Pick the highest semver release rather than the most recent publish:
+            # LTS releases (e.g. 6.18.x) are published alongside current stable releases.
+            echo "Fetching releases from CachyOS/linux..."
+            RELEASES_JSON=$(curl -fsSL \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "https://api.github.com/repos/CachyOS/linux/releases?per_page=50")
+            TAG=$(echo "$RELEASES_JSON" \
+              | jq -r --arg re "$TAG_REGEX" \
+                  '[.[] | select(.draft==false) | select(.prerelease==false) | .tag_name | select(test($re))]
+                   | sort_by([scan("[0-9]+") | tonumber]) | last // empty')
+
+            if [ -z "$TAG" ]; then
+              echo "::error::Could not find a valid CachyOS/linux release matching $TAG_REGEX"
+              exit 1
+            fi
+          fi
+
+          # Tag format: cachyos-7.3.6-2
+          BASEKVER=$(echo "$TAG" | sed -E 's/^cachyos-([0-9]+\.[0-9]+)\.[0-9]+-[0-9]+$/\1/')
+          STABLEKVER=$(echo "$TAG" | sed -E 's/^cachyos-[0-9]+\.[0-9]+\.([0-9]+)-[0-9]+$/\1/')
+          CACHYOSREL=$(echo "$TAG" | sed -E 's/^cachyos-[0-9]+\.[0-9]+\.[0-9]+-([0-9]+)$/\1/')
+
+          # Verify matching CachyOS kernel-patches exist for this major.minor series
+          for patch in "sched/0001-bore-cachy.patch" "misc/dkms-clang.patch"; do
+            PATCH_URL="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/${BASEKVER}/${patch}"
+            if ! curl -fsSI "$PATCH_URL" >/dev/null; then
+              echo "::error::Required patch not found at $PATCH_URL"
+              exit 1
+            fi
+          done
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "basekver=$BASEKVER" >> "$GITHUB_OUTPUT"
+          echo "stablekver=$STABLEKVER" >> "$GITHUB_OUTPUT"
+          echo "cachyosrel=$CACHYOSREL" >> "$GITHUB_OUTPUT"
+          echo "expected_ver_rel=${BASEKVER}.${STABLEKVER}-${CACHYOSREL}.cachyos1.lto" >> "$GITHUB_OUTPUT"
+          echo "Resolved release: $TAG -> _basekver=$BASEKVER _stablekver=$STABLEKVER _cachyosrel=$CACHYOSREL"
+
+      - name: Check whether build is needed
+        id: check
+        env:
+          COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          set -euo pipefail
+
+          CURRENT_TAG=$(grep -E '^%global _tag ' "$SPEC_PATH" | sed 's/^%global _tag //')
+          LATEST_TAG="${{ steps.release.outputs.tag }}"
+          EXPECTED_VER_REL="${{ steps.release.outputs.expected_ver_rel }}"
+
+          echo "Current spec tag : $CURRENT_TAG"
+          echo "Target upstream  : $LATEST_TAG ($EXPECTED_VER_REL)"
+
+          COPR_USER="$COPR_USERNAME_VAR"
+          if [ -z "$COPR_USER" ] && [ -n "${COPR_TOKEN:-}" ]; then
+            COPR_USER=$(printf '%s\n' "$COPR_TOKEN" | sed -nE 's/^[[:space:]]*username[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/p' | head -n 1)
+          fi
+          echo "copr_username=$COPR_USER" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE_BUILD" = "true" ]; then
+            echo "force_build=true — proceeding with build."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$CURRENT_TAG" != "$LATEST_TAG" ]; then
+            echo "New kernel version available: $LATEST_TAG"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Spec already matches upstream; check if COPR has built this version yet
+          # (handles first-time setup without needing a placeholder tag in the spec).
+          if [ -n "$COPR_USER" ]; then
+            PKG_JSON=$(curl -fsSL \
+              "https://copr.fedorainfracloud.org/api_3/package/?ownername=$COPR_USER&projectname=$COPR_PROJECT&packagename=$PKG_NAME&with_latest_build=True&with_latest_succeeded_build=True" \
+              2>/dev/null || echo '{}')
+            EXISTING=$(echo "$PKG_JSON" | jq -r '.builds.latest_succeeded.source_package.version // empty')
+            RUNNING=$(echo "$PKG_JSON" | jq -r '
+              .builds.latest // empty
+              | select(.state? | IN("importing", "pending", "starting", "running", "waiting"))
+              | .source_package.version // empty')
+
+            echo "COPR latest succeeded : ${EXISTING:-none}"
+            echo "COPR in progress      : ${RUNNING:-none}"
+
+            if [ "$EXISTING" != "$EXPECTED_VER_REL" ] && [ "$RUNNING" != "$EXPECTED_VER_REL" ]; then
+              echo "Version $EXPECTED_VER_REL is not yet built on COPR ($COPR_USER/$COPR_PROJECT) — proceeding with build."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "Version $LATEST_TAG is already up to date — skipping build."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install SRPM build dependencies
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl rpm python3-venv
+
+      - name: Patch spec with target version
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          BASEKVER="${{ steps.release.outputs.basekver }}"
+          STABLEKVER="${{ steps.release.outputs.stablekver }}"
+          CACHYOSREL="${{ steps.release.outputs.cachyosrel }}"
+          TAG="${{ steps.release.outputs.tag }}"
+
+          sed -i "s/^%global _basekver .*/%global _basekver ${BASEKVER}/" "$SPEC_PATH"
+          sed -i "s/^%global _stablekver .*/%global _stablekver ${STABLEKVER}/" "$SPEC_PATH"
+          sed -i "s/^%global _cachyosrel .*/%global _cachyosrel ${CACHYOSREL}/" "$SPEC_PATH"
+          sed -i "s/^%global _tag .*/%global _tag ${TAG}/" "$SPEC_PATH"
+
+          echo "Patched spec version macros:"
+          grep -E '^%global _(basekver|stablekver|cachyosrel|tag) ' "$SPEC_PATH"
+
+      - name: Build SRPM
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          rpmbuild -bs "$SPEC_PATH"
+          ls -lh ~/rpmbuild/SRPMS/*.src.rpm
+
+      - name: Upload SRPM artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-srpms
+          path: ~/rpmbuild/SRPMS/*.src.rpm
+          retention-days: 7
+
+      - name: Submit build to COPR
+        id: copr
+        if: steps.check.outputs.skip != 'true'
+        env:
+          COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
+          COPR_USERNAME: ${{ steps.check.outputs.copr_username }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${COPR_TOKEN:-}" ]; then
+            echo "::error::COPR_TOKEN secret is not set. Add your ~/.config/copr contents to repository secret COPR_TOKEN."
+            exit 1
+          fi
+
+          if [ -z "${COPR_USERNAME:-}" ]; then
+            echo "::error::Could not determine COPR username from COPR_USERNAME variable or COPR_TOKEN."
+            exit 1
+          fi
+
+          mkdir -p ~/.config
+          umask 077
+          printf '%s\n' "$COPR_TOKEN" > ~/.config/copr
+
+          python3 -m venv /tmp/copr-venv
+          /tmp/copr-venv/bin/pip install --quiet copr-cli
+
+          SRPM=$(ls ~/rpmbuild/SRPMS/${PKG_NAME}-*.src.rpm 2>/dev/null | head -n 1 || true)
+          if [ -z "$SRPM" ]; then
+            echo "::error::No SRPM found matching ${PKG_NAME}-*.src.rpm"
+            exit 1
+          fi
+
+          SRPM_NAME=$(rpm -qp --queryformat '%{NAME}' "$SRPM")
+          SRPM_VER_REL=$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "$SRPM")
+          echo "Built SRPM: ${SRPM_NAME}-${SRPM_VER_REL}"
+
+          if [ "$FORCE_BUILD" != "true" ]; then
+            PKG_JSON=$(curl -fsSL \
+              "https://copr.fedorainfracloud.org/api_3/package/?ownername=$COPR_USERNAME&projectname=$COPR_PROJECT&packagename=$SRPM_NAME&with_latest_build=True&with_latest_succeeded_build=True" \
+              2>/dev/null || echo '{}')
+            EXISTING=$(echo "$PKG_JSON" | jq -r '.builds.latest_succeeded.source_package.version // empty')
+            RUNNING=$(echo "$PKG_JSON" | jq -r '
+              .builds.latest // empty
+              | select(.state? | IN("importing", "pending", "starting", "running", "waiting"))
+              | .source_package.version // empty')
+
+            if [ -n "$EXISTING" ] && [ "$EXISTING" = "$SRPM_VER_REL" ]; then
+              echo "Version-Release $SRPM_VER_REL already succeeded on $COPR_USERNAME/$COPR_PROJECT, skipping."
+              exit 0
+            elif [ -n "$RUNNING" ] && [ "$RUNNING" = "$SRPM_VER_REL" ]; then
+              echo "Version-Release $SRPM_VER_REL is already building on $COPR_USERNAME/$COPR_PROJECT, skipping."
+              exit 0
+            fi
+          fi
+
+          echo "Submitting $SRPM to COPR project $COPR_USERNAME/$COPR_PROJECT (chroot: $COPR_CHROOT)..."
+          /tmp/copr-venv/bin/copr-cli build --nowait --chroot "$COPR_CHROOT" "$COPR_USERNAME/$COPR_PROJECT" "$SRPM"
+
+      - name: Commit and push updated spec
+        # Only update the repo after COPR accepts the build so failed runs retry automatically.
+        if: steps.copr.outcome == 'success'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$SPEC_PATH"
+          if git diff --cached --quiet; then
+            echo "No spec changes to commit."
+          else
+            git commit -m "chore: bump kernel to ${{ steps.release.outputs.tag }}"
+            git push
+          fi
