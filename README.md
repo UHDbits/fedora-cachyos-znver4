@@ -1,13 +1,13 @@
-# CachyOS Kernel (znver4 + ThinLTO) for Fedora 45+
+# CachyOS Kernel (znver4 + ThinLTO) for Fedora
 
-This repository builds **`kernel-cachyos-znver4-lto`** — the CachyOS BORE kernel compiled with **Clang ThinLTO** and optimized specifically for **AMD Zen 4 / Zen 5 (`znver4`)** CPUs on **Fedora 45 and future Fedora releases**.
+This repository builds **`kernel-cachyos-znver4-lto`** — the CachyOS BORE kernel compiled with **Clang ThinLTO** and optimized specifically for **AMD Zen 4 / Zen 5 (`znver4`)** CPUs on **Fedora**, automatically updating for the latest kernel and Fedora releases.
 
 Based on [CachyOS/copr-linux-cachyos](https://github.com/CachyOS/copr-linux-cachyos) and inspired by [itotm/copr-linux-cachyos-znver4](https://github.com/itotm/copr-linux-cachyos-znver4).
 
 ## Kernel Details
 
 - **Package Name**: `kernel-cachyos-znver4-lto`
-- **Target OS**: Fedora 45+ (`fedora-45-x86_64`, automatically expanding to `fedora-46-x86_64`, `fedora-47-x86_64`, etc. as new Fedora releases branch on COPR)
+- **Target OS**: Fedora `x86_64` (automatically tracks the latest Fedora releases as they become available on COPR)
 - **Scheduler**: BORE with `sched-ext` (`scx`) support
 - **Microarchitecture**: `znver4` (`CONFIG_MZEN4=y` -> `-march=znver4` / `-Ctarget-cpu=znver4`, requires AMD Zen 4 or Zen 5)
 - **Compiler**: Clang / LLVM with **ThinLTO** (`CONFIG_LTO_CLANG_THIN=y`)
@@ -23,14 +23,14 @@ Based on [CachyOS/copr-linux-cachyos](https://github.com/CachyOS/copr-linux-cach
 - `v4l2loopback` and `NTSync` built in
 - `dkms-clang.patch` included for building out-of-tree modules with Clang
 
-## Automated Build & Future Fedora Version Support
+## Automated Builds & Fedora Updates
 
 [`.github/workflows/build-kernel-znver4-lto.yml`](.github/workflows/build-kernel-znver4-lto.yml) runs daily (and on manual `workflow_dispatch`):
 
 1. Resolves the latest stable `CachyOS/linux` release tag (highest semver, ignoring LTS and RCs) and verifies matching `CachyOS/kernel-patches` exist.
-2. Queries COPR's active chroot list for all `fedora-<N>-x86_64` chroots with `N >= MIN_FEDORA_VERSION` (default `45`). Whenever a new Fedora version branches on COPR (e.g. `fedora-46-x86_64`), the workflow **automatically enables that chroot** on your COPR project and submits a build for it—no manual repo edits required.
+2. Checks COPR's active chroots and **automatically enables newer Fedora `x86_64` releases** on the COPR project as they branch—no manual repo edits required.
 3. Skips quickly when both the kernel version and Fedora chroots are already up to date.
-4. Patches [`sources/kernel-cachyos-bore/kernel-cachyos-lto.spec`](sources/kernel-cachyos-bore/kernel-cachyos-lto.spec), builds the `.src.rpm`, and submits it to Fedora COPR for all enabled chroots (each binary RPM automatically gets its Fedora dist tag via `%{?dist}`, e.g. `.fc45`, `.fc46`).
+4. Patches [`sources/kernel-cachyos-bore/kernel-cachyos-lto.spec`](sources/kernel-cachyos-bore/kernel-cachyos-lto.spec), builds the `.src.rpm`, and submits it to Fedora COPR for all enabled chroots (each binary RPM automatically gets its Fedora dist tag via `%{?dist}`).
 5. Commits the bumped spec back to the repository only after COPR accepts the build.
 
 ### Optional GitHub Repository Variables
@@ -41,15 +41,15 @@ The workflow automatically reads your COPR username from the `COPR_TOKEN` secret
 | --- | --- | --- |
 | `COPR_PROJECT` | `kernel-cachyos-znver4-lto` | Name of your COPR project |
 | `COPR_USERNAME` | *(parsed from `COPR_TOKEN`)* | Your Fedora FAS / COPR username |
-| `MIN_FEDORA_VERSION` | `45` | Automatically enable and build all active `fedora-<N>-x86_64` chroots from this version onward |
-| `COPR_CHROOT` | *(unset — all enabled chroots)* | Set to pin builds to a single chroot (disables automatic future Fedora chroot sync) |
+| `MIN_FEDORA_VERSION` | `45` | Minimum Fedora release version to auto-enable on COPR (newer releases are added automatically) |
+| `COPR_CHROOT` | *(unset — all enabled chroots)* | Set to pin builds to a single chroot (disables automatic Fedora release sync) |
 
 ## Deployment Setup (GitHub + COPR)
 
 1. **Push this repository to GitHub** (e.g. `UHDbits/fedora-cachyos-znver4`).
 2. **Create a COPR project** at [copr.fedorainfracloud.org](https://copr.fedorainfracloud.org):
    - **Project name**: `kernel-cachyos-znver4-lto`
-   - **Chroots**: enable `fedora-45-x86_64` *(future `fedora-46-x86_64`, etc. will be enabled automatically by the workflow; optionally also enable `fedora-rawhide-x86_64` with **Follow Fedora branching** checked if you want Rawhide too)*
+   - **Chroots**: enable the current Fedora `x86_64` chroot *(newer Fedora releases are enabled automatically by the workflow; optionally also enable `fedora-rawhide-x86_64` with **Follow Fedora branching** checked if you want Rawhide too)*
    - **Enable internet access during builds**: checked (optional since the SRPM bundles all sources)
 3. **Get your COPR API token** from [copr.fedorainfracloud.org/api/](https://copr.fedorainfracloud.org/api/) and copy the entire `[copr-cli]` block.
 4. **Add the GitHub Actions secret**:
@@ -59,7 +59,7 @@ The workflow automatically reads your COPR username from the `COPR_TOKEN` secret
 5. **Trigger the first build**:
    - Go to **Actions → Build kernel-cachyos-znver4-lto → Run workflow → Run workflow**.
 
-## Installation on Fedora 45+
+## Installation
 
 Replace `<your-copr-user>` with your Fedora COPR username:
 
