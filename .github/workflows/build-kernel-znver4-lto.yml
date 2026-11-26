@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       force_build:
-        description: "Force SRPM build and COPR submission even if version already exists"
+        description: "Force triggering a COPR rebuild even if version already exists"
         type: boolean
         default: false
       tag:
@@ -21,18 +21,16 @@ concurrency:
 env:
   SPEC_PATH: sources/kernel-cachyos-bore/kernel-cachyos-lto.spec
   PKG_NAME: kernel-cachyos-znver4-lto
+  COPR_USERNAME: ${{ vars.COPR_USERNAME || 'uhdbits' }}
   COPR_PROJECT: ${{ vars.COPR_PROJECT || 'kernel-cachyos-znver4-lto' }}
-  COPR_USERNAME_VAR: ${{ vars.COPR_USERNAME }}
-  COPR_CHROOT: ${{ vars.COPR_CHROOT }}
-  MIN_FEDORA_VERSION: ${{ vars.MIN_FEDORA_VERSION || '45' }}
 
 permissions:
   contents: write
 
 jobs:
-  check-and-build:
+  check-and-trigger:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -94,10 +92,9 @@ jobs:
           echo "expected_ver_rel=${BASEKVER}.${STABLEKVER}-${CACHYOSREL}.cachyos1.lto" >> "$GITHUB_OUTPUT"
           echo "Resolved release: $TAG -> _basekver=$BASEKVER _stablekver=$STABLEKVER _cachyosrel=$CACHYOSREL"
 
-      - name: Check whether build or chroot sync is needed
+      - name: Check whether update or COPR build is needed
         id: check
         env:
-          COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
           FORCE_BUILD: ${{ inputs.force_build }}
         run: |
           set -euo pipefail
@@ -109,46 +106,8 @@ jobs:
           echo "Current spec tag : $CURRENT_TAG"
           echo "Target upstream  : $LATEST_TAG ($EXPECTED_VER_REL)"
 
-          COPR_USER="$COPR_USERNAME_VAR"
-          if [ -z "$COPR_USER" ] && [ -n "${COPR_TOKEN:-}" ]; then
-            COPR_USER=$(printf '%s\n' "$COPR_TOKEN" | sed -nE 's/^[[:space:]]*username[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/p' | head -n 1)
-          fi
-          echo "copr_username=$COPR_USER" >> "$GITHUB_OUTPUT"
-
-          # Detect any newly branched Fedora x86_64 chroots (>= MIN_FEDORA_VERSION)
-          # that are not yet enabled on the COPR project (skipped if COPR_CHROOT is pinned).
-          NEW_CHROOTS=""
-          if [ -z "$COPR_CHROOT" ] && [ -n "$COPR_USER" ]; then
-            ACTIVE_MOCKS=$(curl -fsSL "https://copr.fedorainfracloud.org/api_3/mock-chroots/list" 2>/dev/null || echo '{}')
-            PROJ_JSON=$(curl -fsSL \
-              "https://copr.fedorainfracloud.org/api_3/project?ownername=$COPR_USER&projectname=$COPR_PROJECT" \
-              2>/dev/null || echo '{}')
-
-            TARGET_FEDORA=$(echo "$ACTIVE_MOCKS" | jq -r --argjson min "$MIN_FEDORA_VERSION" '
-              keys
-              | map(select(test("^fedora-[0-9]+-x86_64$")))
-              | map(select((capture("^fedora-(?<v>[0-9]+)-x86_64$").v | tonumber) >= $min))
-              | sort[]')
-            CURRENT_CHROOTS=$(echo "$PROJ_JSON" | jq -r '(.chroot_repos // {}) | keys | sort[]')
-
-            echo "Active COPR Fedora >= ${MIN_FEDORA_VERSION} chroots: $(echo "$TARGET_FEDORA" | tr '\n' ' ')"
-            echo "Project enabled chroots: $(echo "$CURRENT_CHROOTS" | tr '\n' ' ')"
-
-            if [ -n "$CURRENT_CHROOTS" ] && [ -n "$TARGET_FEDORA" ]; then
-              NEW_CHROOTS=$(LC_ALL=C comm -23 \
-                <(printf '%s\n' "$TARGET_FEDORA" | LC_ALL=C sort) \
-                <(printf '%s\n' "$CURRENT_CHROOTS" | LC_ALL=C sort) \
-                | tr '\n' ' ' | sed 's/ *$//')
-            fi
-          fi
-          echo "new_chroots=$NEW_CHROOTS" >> "$GITHUB_OUTPUT"
-
-          if [ -n "$NEW_CHROOTS" ]; then
-            echo "New Fedora chroot(s) available on COPR: $NEW_CHROOTS"
-          fi
-
           if [ "$FORCE_BUILD" = "true" ]; then
-            echo "force_build=true — proceeding with build."
+            echo "force_build=true — proceeding."
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -159,44 +118,31 @@ jobs:
             exit 0
           fi
 
-          if [ -n "$NEW_CHROOTS" ]; then
-            echo "Enabling and building for newly available Fedora chroot(s): $NEW_CHROOTS"
+          # Spec matches upstream; check COPR's public API to see if this version
+          # has already been built (also self-heals if a previous webhook call failed
+          # or on first-time setup).
+          PKG_JSON=$(curl -fsSL \
+            "https://copr.fedorainfracloud.org/api_3/package/?ownername=$COPR_USERNAME&projectname=$COPR_PROJECT&packagename=$PKG_NAME&with_latest_build=True&with_latest_succeeded_build=True" \
+            2>/dev/null || echo '{}')
+          EXISTING=$(echo "$PKG_JSON" | jq -r '.builds.latest_succeeded.source_package.version // empty')
+          RUNNING=$(echo "$PKG_JSON" | jq -r '
+            .builds.latest // empty
+            | select(.state? | IN("importing", "pending", "starting", "running", "waiting"))
+            | .source_package.version // empty')
+
+          echo "COPR latest succeeded : ${EXISTING:-none}"
+          echo "COPR in progress      : ${RUNNING:-none}"
+
+          if [ "$EXISTING" != "$EXPECTED_VER_REL" ] && [ "$RUNNING" != "$EXPECTED_VER_REL" ]; then
+            echo "Version $EXPECTED_VER_REL is not yet built on COPR ($COPR_USERNAME/$COPR_PROJECT) — triggering build."
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Spec matches upstream and chroots are synced; check if COPR has built this version yet
-          # (handles first-time setup without needing a placeholder tag in the spec).
-          if [ -n "$COPR_USER" ]; then
-            PKG_JSON=$(curl -fsSL \
-              "https://copr.fedorainfracloud.org/api_3/package/?ownername=$COPR_USER&projectname=$COPR_PROJECT&packagename=$PKG_NAME&with_latest_build=True&with_latest_succeeded_build=True" \
-              2>/dev/null || echo '{}')
-            EXISTING=$(echo "$PKG_JSON" | jq -r '.builds.latest_succeeded.source_package.version // empty')
-            RUNNING=$(echo "$PKG_JSON" | jq -r '
-              .builds.latest // empty
-              | select(.state? | IN("importing", "pending", "starting", "running", "waiting"))
-              | .source_package.version // empty')
-
-            echo "COPR latest succeeded : ${EXISTING:-none}"
-            echo "COPR in progress      : ${RUNNING:-none}"
-
-            if [ "$EXISTING" != "$EXPECTED_VER_REL" ] && [ "$RUNNING" != "$EXPECTED_VER_REL" ]; then
-              echo "Version $EXPECTED_VER_REL is not yet built on COPR ($COPR_USER/$COPR_PROJECT) — proceeding with build."
-              echo "skip=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-
-          echo "Version $LATEST_TAG and all Fedora >= ${MIN_FEDORA_VERSION} chroots are up to date — skipping build."
+          echo "Version $LATEST_TAG is already up to date on COPR — skipping."
           echo "skip=true" >> "$GITHUB_OUTPUT"
 
-      - name: Install SRPM build dependencies
-        if: steps.check.outputs.skip != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl rpm python3-venv
-
-      - name: Patch spec with target version
+      - name: Update spec and push commit
         if: steps.check.outputs.skip != 'true'
         run: |
           set -euo pipefail
@@ -211,141 +157,29 @@ jobs:
           sed -i "s/^%global _cachyosrel .*/%global _cachyosrel ${CACHYOSREL}/" "$SPEC_PATH"
           sed -i "s/^%global _tag .*/%global _tag ${TAG}/" "$SPEC_PATH"
 
-          echo "Patched spec version macros:"
-          grep -E '^%global _(basekver|stablekver|cachyosrel|tag) ' "$SPEC_PATH"
-
-      - name: Build SRPM
-        if: steps.check.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-          rpmbuild -bs "$SPEC_PATH"
-          ls -lh ~/rpmbuild/SRPMS/*.src.rpm
-
-      - name: Upload SRPM artifact
-        if: steps.check.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-srpms
-          path: ~/rpmbuild/SRPMS/*.src.rpm
-          retention-days: 7
-
-      - name: Sync Fedora chroots and submit build to COPR
-        id: copr
-        if: steps.check.outputs.skip != 'true'
-        env:
-          COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
-          COPR_USERNAME: ${{ steps.check.outputs.copr_username }}
-          NEW_CHROOTS: ${{ steps.check.outputs.new_chroots }}
-          FORCE_BUILD: ${{ inputs.force_build }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${COPR_TOKEN:-}" ]; then
-            echo "::error::COPR_TOKEN secret is not set. Add your ~/.config/copr contents to repository secret COPR_TOKEN."
-            exit 1
-          fi
-
-          if [ -z "${COPR_USERNAME:-}" ]; then
-            echo "::error::Could not determine COPR username from COPR_USERNAME variable or COPR_TOKEN."
-            exit 1
-          fi
-
-          mkdir -p ~/.config
-          umask 077
-          printf '%s\n' "$COPR_TOKEN" > ~/.config/copr
-
-          python3 -m venv /tmp/copr-venv
-          /tmp/copr-venv/bin/pip install --quiet copr-cli
-
-          # Automatically enable newly branched Fedora (>= MIN_FEDORA_VERSION) chroots on COPR
-          if [ -n "$NEW_CHROOTS" ] && [ -z "$COPR_CHROOT" ]; then
-            echo "Enabling new Fedora chroot(s) on $COPR_USERNAME/$COPR_PROJECT: $NEW_CHROOTS"
-            /tmp/copr-venv/bin/python - <<'PY'
-          import os, re
-          from copr.v3 import Client
-
-          owner = os.environ["COPR_USERNAME"]
-          project = os.environ["COPR_PROJECT"]
-          min_ver = int(os.environ["MIN_FEDORA_VERSION"])
-
-          client = Client.create_from_config_file()
-          active = set(client.mock_chroot_proxy.get_list().keys())
-          proj = client.project_proxy.get(owner, project)
-          current = set((proj.chroot_repos or {}).keys())
-
-          target_fedora = {
-              c for c in active
-              if (m := re.fullmatch(r"fedora-(\d+)-x86_64", c)) and int(m.group(1)) >= min_ver
-          }
-          desired = sorted((current & active) | target_fedora)
-          print("Updating COPR project chroots to:", desired)
-          client.project_proxy.edit(ownername=owner, projectname=project, chroots=desired)
-          PY
-          fi
-
-          SRPM=$(ls ~/rpmbuild/SRPMS/${PKG_NAME}-*.src.rpm 2>/dev/null | head -n 1 || true)
-          if [ -z "$SRPM" ]; then
-            echo "::error::No SRPM found matching ${PKG_NAME}-*.src.rpm"
-            exit 1
-          fi
-
-          SRPM_NAME=$(rpm -qp --queryformat '%{NAME}' "$SRPM")
-          SRPM_VER_REL=$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "$SRPM")
-          echo "Built SRPM: ${SRPM_NAME}-${SRPM_VER_REL}"
-
-          CHROOT_ARGS=()
-          if [ -n "$COPR_CHROOT" ]; then
-            CHROOT_ARGS+=(--chroot "$COPR_CHROOT")
-          fi
-
-          if [ "$FORCE_BUILD" != "true" ]; then
-            PKG_JSON=$(curl -fsSL \
-              "https://copr.fedorainfracloud.org/api_3/package/?ownername=$COPR_USERNAME&projectname=$COPR_PROJECT&packagename=$SRPM_NAME&with_latest_build=True&with_latest_succeeded_build=True" \
-              2>/dev/null || echo '{}')
-            EXISTING=$(echo "$PKG_JSON" | jq -r '.builds.latest_succeeded.source_package.version // empty')
-            RUNNING=$(echo "$PKG_JSON" | jq -r '
-              .builds.latest // empty
-              | select(.state? | IN("importing", "pending", "starting", "running", "waiting"))
-              | .source_package.version // empty')
-
-            if [ -n "$EXISTING" ] && [ "$EXISTING" = "$SRPM_VER_REL" ]; then
-              if [ -n "$NEW_CHROOTS" ] && [ -z "$COPR_CHROOT" ]; then
-                echo "Version $SRPM_VER_REL already exists on older chroots; building only for new chroot(s): $NEW_CHROOTS"
-                for chroot in $NEW_CHROOTS; do
-                  CHROOT_ARGS+=(--chroot "$chroot")
-                done
-              else
-                echo "Version-Release $SRPM_VER_REL already succeeded on $COPR_USERNAME/$COPR_PROJECT, skipping."
-                exit 0
-              fi
-            elif [ -n "$RUNNING" ] && [ "$RUNNING" = "$SRPM_VER_REL" ]; then
-              if [ -n "$NEW_CHROOTS" ] && [ -z "$COPR_CHROOT" ]; then
-                echo "Version $SRPM_VER_REL is already building on older chroots; also submitting for new chroot(s): $NEW_CHROOTS"
-                for chroot in $NEW_CHROOTS; do
-                  CHROOT_ARGS+=(--chroot "$chroot")
-                done
-              else
-                echo "Version-Release $SRPM_VER_REL is already building on $COPR_USERNAME/$COPR_PROJECT, skipping."
-                exit 0
-              fi
-            fi
-          fi
-
-          echo "Submitting $SRPM to COPR project $COPR_USERNAME/$COPR_PROJECT ${CHROOT_ARGS[*]:-(all enabled chroots)}..."
-          /tmp/copr-venv/bin/copr-cli build --nowait "${CHROOT_ARGS[@]}" "$COPR_USERNAME/$COPR_PROJECT" "$SRPM"
-
-      - name: Commit and push updated spec
-        # Only update the repo after COPR accepts the build so failed runs retry automatically.
-        if: steps.copr.outcome == 'success'
-        run: |
-          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$SPEC_PATH"
           if git diff --cached --quiet; then
-            echo "No spec changes to commit."
+            echo "Spec already at ${TAG}; no commit needed."
           else
-            git commit -m "chore: bump kernel to ${{ steps.release.outputs.tag }}"
+            git commit -m "chore: bump kernel to ${TAG}"
             git push
           fi
+
+      - name: Trigger COPR rebuild via custom webhook
+        if: steps.check.outputs.skip != 'true'
+        env:
+          COPR_WEBHOOK_URL: ${{ secrets.COPR_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${COPR_WEBHOOK_URL:-}" ]; then
+            echo "::error::COPR_WEBHOOK_URL secret is not set. Add your COPR Custom Webhook URL (Settings -> Integrations -> Custom webhook) as repository secret COPR_WEBHOOK_URL."
+            exit 1
+          fi
+
+          echo "Triggering COPR SCM build for ${COPR_USERNAME}/${COPR_PROJECT} (${PKG_NAME})..."
+          curl -fsSL -X POST "$COPR_WEBHOOK_URL"
+          echo ""
+          echo "COPR rebuild triggered successfully."
