@@ -14,8 +14,8 @@
 # from the latest stable CachyOS/linux release tag.
 %global _basekver 7.3
 %global _stablekver 6
-%global _cachyosrel 2
-%global _tag cachyos-7.3.6-2
+%global _cachyosrel 3
+%global _tag cachyos-7.3.6-3
 %define _rpmver %{version}-%{release}
 %define _kver %{_rpmver}.%{_arch}
 
